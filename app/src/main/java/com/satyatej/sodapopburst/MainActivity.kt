@@ -1,222 +1,147 @@
 package com.satyatej.sodapopburst
 
-import android.content.Context
 import android.media.SoundPool
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer // <-- Import graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.isActive
-import kotlin.math.max
-import kotlin.math.roundToInt // <-- Added missing import
-import kotlin.random.Random
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import com.satyatej.sodapopburst.ui.theme.SodaPopBurstTheme
+import kotlinx.coroutines.flow.collectLatest
+import kotlin.math.roundToInt
 
-// --- OBJECT POOLING ---
-private var nextBottleId = 0L // Simpler ID generation
+// Define GameState here or move to a separate shared file
+enum class GameState { PLAYING, GAME_OVER }
 
-// Bottle class modified for pooling
-data class Bottle(
-    var id: Long = 0,
-    var x: Float = 0f,
-    var y: Float = 0f,
-    var color: Color = Color.Transparent,
-    var speedFactor: Float = 1f,
-    var active: Boolean = false
-) {
-    fun reset(startX: Float, startY: Float, startColor: Color) {
-        id = nextBottleId++ // Assign next ID
-        x = startX
-        y = startY
-        color = startColor
-        speedFactor = Random.nextFloat() * 0.5f + 0.8f // Randomize speed on reset
-        active = true
-    }
-}
-
-// Predefined soda colors (unchanged)
-val sodaColors = listOf(
-    Color(0xFFE53935), Color(0xFF43A047), Color(0xFF1E88E5),
-    Color(0xFFFDD835), Color(0xFF8E24AA), Color(0xFFFF7043)
-)
-
-// --- Main Activity (unchanged) ---
 class MainActivity : ComponentActivity() {
+
+    private var soundPool: SoundPool? = null
+    private var burstSoundId: Int = 0
+    private var missSoundId: Int = 0
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setupSoundPool()
         setContent {
             SodaPopBurstTheme {
-                GameScreen()
+                // --- Sound Pool Management ---
+                DisposableEffect(Unit) {
+                    onDispose {
+                        Log.d("MainActivity", "onDispose - Releasing SoundPool")
+                        releaseSoundPool()
+                    }
+                }
+
+                // --- Main Game Screen ---
+                GameScreenWithSurfaceView(
+                    playBurstSound = { playSound(burstSoundId) },
+                    playMissSound = { playSound(missSoundId) }
+                )
             }
         }
+    }
+
+    private fun setupSoundPool() {
+        soundPool = SoundPool.Builder()
+            .setMaxStreams(5)
+            .build()
+        try {
+            burstSoundId = soundPool!!.load(this, R.raw.burst_sound, 1)
+            missSoundId = soundPool!!.load(this, R.raw.miss_sound, 1)
+            Log.d("MainActivity", "Sounds loaded: Burst=$burstSoundId, Miss=$missSoundId")
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Failed to load sounds", e)
+            burstSoundId = 0
+            missSoundId = 0
+        }
+    }
+
+    private fun playSound(soundId: Int) {
+        if (soundId != 0) {
+            soundPool?.play(soundId, 0.8f, 0.8f, 1, 0, 1f) // Slightly lower volume
+        } else {
+            Log.w("MainActivity", "Attempted to play sound with ID 0")
+        }
+    }
+
+    private fun releaseSoundPool() {
+        soundPool?.release()
+        soundPool = null
+        Log.d("MainActivity", "SoundPool released")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Release handled by DisposableEffect
+        Log.d("MainActivity", "onDestroy")
     }
 }
 
-// --- Game Screen Composable ---
 @Composable
-fun GameScreen() {
-    val context = LocalContext.current
-    val density = LocalDensity.current
+fun GameScreenWithSurfaceView(
+    playBurstSound: () -> Unit,
+    playMissSound: () -> Unit
+) {
+    // Hold a reference to the GameSurfaceView instance using remember
+    val gameSurfaceView = remember { mutableStateOf<GameSurfaceView?>(null) }
 
-    // --- Calculated Pixel Values (unchanged) ---
-    val baseSpeedDp = 60.dp
-    val baseSpeedPxPerSec = remember(density) { with(density) { baseSpeedDp.toPx() } }
-    val bottleWidthDp = 40.dp
-    val bottleHeightDp = 80.dp
-    val initialBottleOffsetYDp = -80.dp
-    val bottleWidthPx = remember(density) { with(density) { bottleWidthDp.toPx() } }
-    val bottleHeightPx = remember(density) { with(density) { bottleHeightDp.toPx() } }
-    val initialBottleOffsetYPx = remember(density) { with(density) { initialBottleOffsetYDp.toPx() } }
-    val bottleDrawSize = remember(bottleWidthPx, bottleHeightPx) { Size(bottleWidthPx, bottleHeightPx) }
+    // --- State Collection ---
+    val score by gameSurfaceView.value?.scoreFlow?.collectAsState() ?: remember { mutableStateOf(0) }
+    val gameState by gameSurfaceView.value?.gameStateFlow?.collectAsState() ?: remember { mutableStateOf(GameState.PLAYING) } // Default to PLAYING initially
 
-    // --- Game State ---
-    var score by rememberSaveable { mutableStateOf(0) }
-    var intensity by remember { mutableStateOf(1f) }
-    val activeBottles = remember { mutableStateListOf<Bottle>() } // List of bottles currently in play
-    var screenSize by remember { mutableStateOf(IntSize.Zero) }
-    var gameState by remember { mutableStateOf(GameState.PLAYING) }
-    var lastSpawnTime by remember { mutableStateOf(0L) }
+    // Local UI state for the intensity slider
+    var intensitySliderValue by remember { mutableStateOf(1f) }
 
-    // --- OBJECT POOL ---
-    val bottlePool = remember { mutableStateListOf<Bottle>() }
-
-    // Function to get a bottle from the pool or create one
-    fun obtainBottle(): Bottle {
-        return if (bottlePool.isNotEmpty()) {
-            // Fixed: Use removeAt(lastIndex) for compatibility with API < 35
-            bottlePool.removeAt(bottlePool.lastIndex)
-        } else {
-            Bottle() // Create new if pool is empty
+    // --- Lifecycle Management for GameSurfaceView's CoroutineScope ---
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, gameSurfaceView.value) {
+        val view = gameSurfaceView.value
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_DESTROY) {
+                Log.d("MainActivityComposable", "ON_DESTROY detected, cleaning up view")
+                view?.cleanup() // Call cleanup when the Activity is destroyed
+            }
+            // Add ON_PAUSE / ON_RESUME handling if needed by calling corresponding methods on view
+            // if (event == Lifecycle.Event.ON_PAUSE) view?.pauseGameLoop()
+            // if (event == Lifecycle.Event.ON_RESUME) view?.resumeGameLoop()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            Log.d("MainActivityComposable", "onDispose - Removing observer")
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            // Cleanup might be called here too if composable disposes before Activity
+            // view?.cleanup() // Optional: depends on desired cleanup timing
         }
     }
 
-    // Function to release a bottle back to the pool
-    fun releaseBottle(bottle: Bottle) {
-        bottle.active = false
-        bottlePool.add(bottle)
+
+    // --- Effect to update GameSurfaceView's intensity when slider changes ---
+    LaunchedEffect(intensitySliderValue, gameSurfaceView.value) {
+        gameSurfaceView.value?.updateIntensity(intensitySliderValue)
     }
-
-    // --- Sound Effects Setup (unchanged) ---
-    val soundPool = remember {
-        SoundPool.Builder().setMaxStreams(5).build()
-    }
-    val burstSoundId = remember(context) {
-        try { soundPool.load(context, R.raw.burst_sound, 1) }
-        catch (e: Exception) { Log.e("SoundLoad", "Failed to load burst_sound", e); 0 }
-    }
-    val missSoundId = remember(context) {
-        try { soundPool.load(context, R.raw.miss_sound, 1) }
-        catch (e: Exception) { Log.e("SoundLoad", "Failed to load miss_sound", e); 0 }
-    }
-    DisposableEffect(Unit) {
-        onDispose { Log.d("SoundPool", "Releasing SoundPool"); soundPool.release() }
-    }
-    fun playSound(soundId: Int) {
-        if (soundId != 0) { soundPool.play(soundId, 1f, 1f, 1, 0, 1f) }
-        else { Log.w("SoundPlay", "Attempted to play sound with ID 0") }
-    }
-
-    // --- Game Loop using withFrameNanos ---
-    LaunchedEffect(gameState, intensity, baseSpeedPxPerSec, bottleWidthPx, initialBottleOffsetYPx) {
-        if (gameState == GameState.PLAYING) {
-            Log.i("GameLoop", "LaunchedEffect Started (withFrameNanos) for PLAYING state.")
-            var lastFrameTimeNanos = -1L
-
-            while (isActive && gameState == GameState.PLAYING) {
-                val frameTimeNanos = withFrameNanos { it }
-                if (lastFrameTimeNanos != -1L) {
-                    val deltaTime = (frameTimeNanos - lastFrameTimeNanos) / 1_000_000_000.0f
-                    val clampedDeltaTime = deltaTime // Still using raw delta time
-
-                    Log.v("GameLoopTiming", "DeltaTime: ${String.format("%.4f", clampedDeltaTime)}, Active Bottles: ${activeBottles.size}, Pool Size: ${bottlePool.size}")
-
-                    if (screenSize.height > 0) {
-                        val speedMultiplier = 1f + (intensity / 10f) * 4f
-                        val fallSpeedPx = baseSpeedPxPerSec * speedMultiplier * clampedDeltaTime
-
-                        // Update Bottle Positions using ListIterator for safe removal
-                        val iterator = activeBottles.listIterator()
-                        while (iterator.hasNext()) {
-                            val bottle = iterator.next()
-                            bottle.y += fallSpeedPx * bottle.speedFactor
-
-                            // Check miss condition
-                            if (bottle.y > screenSize.height) {
-                                Log.d("GameLoop", "Bottle ${bottle.id} missed")
-                                iterator.remove() // Remove from active list
-                                releaseBottle(bottle) // Return to pool
-                                playSound(missSoundId)
-                                gameState = GameState.GAME_OVER
-                                break // Exit update loop immediately on miss
-                            }
-                        }
-
-                        if (gameState == GameState.GAME_OVER) break // Exit outer loop
-
-                        // Spawn New Bottles
-                        val spawnDelayMillis = max(200L, (1500 - intensity * 120).toLong())
-                        if (System.currentTimeMillis() - lastSpawnTime > spawnDelayMillis && screenSize.width > 0) {
-                            val randomXPercent = Random.nextFloat()
-                            val maxXPx = screenSize.width - bottleWidthPx
-                            val spawnXPx = (randomXPercent * maxXPx).coerceAtLeast(0f)
-
-                            val bottle = obtainBottle() // Get from pool or create
-                            bottle.reset(
-                                startX = if (screenSize.width > 0) spawnXPx / screenSize.width else 0f,
-                                startY = initialBottleOffsetYPx,
-                                startColor = sodaColors.random()
-                            )
-                            activeBottles.add(bottle) // Add to active list
-
-                            Log.d("GameSpawn", "Spawned bottle ${bottle.id} from pool: ${bottlePool.contains(bottle)}")
-                            lastSpawnTime = System.currentTimeMillis()
-                        }
-                    }
-                }
-                lastFrameTimeNanos = frameTimeNanos
-            } // End while loop
-        } // End if PLAYING
-        Log.i("GameLoop", "LaunchedEffect (withFrameNanos) finishing. GameState: $gameState")
-    } // End LaunchedEffect
-
 
     // --- UI Layout ---
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .onGloballyPositioned { layoutCoordinates ->
-                if (screenSize != layoutCoordinates.size && layoutCoordinates.size.height > 0) {
-                    screenSize = layoutCoordinates.size
-                    Log.i("Layout", "Screen size initialised: $screenSize")
-                }
-            }
-    ) {
-        // 1. Background Image (unchanged)
+    Box(modifier = Modifier.fillMaxSize()) { // Layer background and game elements
+
+        // 1. Background Image
         Image(
             painter = painterResource(id = R.drawable.game_background),
             contentDescription = "Game Background",
@@ -224,165 +149,108 @@ fun GameScreen() {
             contentScale = ContentScale.Crop
         )
 
-        // 2. Tap Detection Layer
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(bottleWidthPx, bottleHeightPx, activeBottles.size) { // Depend on activeBottles.size
-                    detectTapGestures { touchOffset ->
-                        if (gameState == GameState.PLAYING && screenSize.width > 0) {
-                            var bottleTapped = false
-                            // Iterate forward with index for potential minor efficiency
-                            val listSize = activeBottles.size
-                            for(i in 0 until listSize) {
-                                // Check if index is still valid after potential removals
-                                if (i >= activeBottles.size) break
-
-                                val bottle = activeBottles[i]
-                                val bottleXPx = bottle.x * screenSize.width
-                                val bottleYPx = bottle.y
-                                val tapRect = Rect(
-                                    left = bottleXPx - (bottleWidthPx * 0.3f),
-                                    top = bottleYPx - (bottleHeightPx * 0.5f),
-                                    right = bottleXPx + bottleWidthPx + (bottleWidthPx * 0.3f),
-                                    bottom = bottleYPx + (bottleHeightPx * 1.0f)
-                                )
-                                // Log.d("TapDebug", "Tap at: ${touchOffset.x.toInt()}, ${touchOffset.y.toInt()}. Checking Bottle $i (ID ${bottle.id})")
-                                if (tapRect.contains(touchOffset)) {
-                                    Log.i("TapDebug", ">>> SUCCESSFUL TAP on Bottle Index $i (ID ${bottle.id})")
-                                    val removedBottle = activeBottles.removeAt(i)
-                                    releaseBottle(removedBottle) // Return to pool
-                                    score++
-                                    playSound(burstSoundId)
-                                    bottleTapped = true
-                                    break // Exit tap loop once a bottle is hit
-                                }
-                            }
-                            // if (!bottleTapped) { Log.d("TapDebug", "--- Tap missed all bottles.") }
-                        }
-                    }
-                }
-        )
-
-        // 3. Canvas Layer for Drawing Bottles
-        Canvas(modifier = Modifier
-            .fillMaxSize()
-            .graphicsLayer() // <-- Added graphicsLayer modifier
-        ) {
-            val bottleCount = activeBottles.size
-            for (i in 0 until bottleCount) {
-                val bottle = activeBottles[i]
-                val drawX = bottle.x * size.width
-                val drawY = bottle.y
-                if (drawY < size.height + bottleHeightPx && drawY > -bottleHeightPx * 2) {
-                    drawRect(
-                        color = bottle.color,
-                        topLeft = Offset(drawX, drawY),
-                        size = bottleDrawSize
-                    )
-                }
-            }
-        }
-
-        // 4. UI Overlay (Score, Slider, Game Over)
+        // 2. Game Area and UI Overlay Column
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
+            modifier = Modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Score Text (unchanged)
+            // Score Display
             Text(
                 text = "Score: $score",
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White,
                 modifier = Modifier
+                    .padding(top = 16.dp)
                     .background(Color.Black.copy(alpha = 0.5f), shape = MaterialTheme.shapes.medium)
                     .padding(horizontal = 12.dp, vertical = 4.dp)
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
+            // Game SurfaceView Container
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f) // Takes up available space
+                    .pointerInput(Unit) { // Handle taps within this Box
+                        detectTapGestures {
+                            gameSurfaceView.value?.handleTap(it.x, it.y) // Pass offset x, y
+                        }
+                    }
+            ) {
+                AndroidView(
+                    factory = { context ->
+                        // Create and store the reference
+                        GameSurfaceView(context).apply {
+                            // Pass sound lambdas during creation
+                            this.playBurstSound = playBurstSound
+                            this.playMissSound = playMissSound
+                            gameSurfaceView.value = this // Update the state holder
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
 
-            // Intensity Slider (unchanged)
+            // Intensity Slider (only visible when playing)
             if (gameState == GameState.PLAYING) {
-                Row(verticalAlignment = Alignment.CenterVertically,
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
                         .background(Color.Black.copy(alpha = 0.5f), shape = MaterialTheme.shapes.medium)
                         .padding(horizontal = 12.dp, vertical = 4.dp)
                 ) {
                     Text("Speed:", color = Color.White, modifier = Modifier.padding(end = 8.dp))
                     Slider(
-                        value = intensity,
-                        onValueChange = { intensity = it },
+                        value = intensitySliderValue,
+                        onValueChange = { intensitySliderValue = it }, // Update local UI state
                         valueRange = 0f..10f,
                         steps = 9,
                         modifier = Modifier.weight(1f)
                     )
                     Text(
-                        // Fixed: Use roundToInt from import
-                        text = intensity.roundToInt().toString(),
+                        text = intensitySliderValue.roundToInt().toString(),
                         color = Color.White,
-                        modifier = Modifier.padding(start = 8.dp).width(20.dp)
+                        modifier = Modifier.padding(start = 8.dp).width(30.dp) // Wider text area
                     )
                 }
+            } else {
+                // Reserve space for the slider when game is over to prevent layout jumps
+                Spacer(modifier = Modifier.height(56.dp).fillMaxWidth()) // Adjust height as needed
             }
+        } // End Column
 
-            // Game Over Screen
-            if (gameState == GameState.GAME_OVER) {
-                Spacer(modifier = Modifier.weight(1f))
+        // --- Game Over Overlay --- (Drawn on top)
+        if (gameState == GameState.GAME_OVER) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.75f)), // Darker overlay
+                contentAlignment = Alignment.Center
+            ) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                     modifier = Modifier
                         .fillMaxWidth(0.8f)
-                        .background(Color.Black.copy(alpha = 0.7f), shape = MaterialTheme.shapes.large)
                         .padding(32.dp)
                 ) {
-                    Text("Game Over!", fontSize = 32.sp, color = Color.Red, fontWeight = FontWeight.Bold)
+                    Text("Game Over!", fontSize = 36.sp, color = Color.Red, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text("Final Score: $score", fontSize = 24.sp, color = Color.White)
+                    Text("Final Score: $score", fontSize = 28.sp, color = Color.White)
                     Spacer(modifier = Modifier.height(24.dp))
-                    Button(onClick = {
-                        // Reset Game State
-                        score = 0
-                        // Release all active bottles back to the pool before clearing
-                        activeBottles.forEach { releaseBottle(it) }
-                        activeBottles.clear()
-                        intensity = 1f
-                        gameState = GameState.PLAYING
-                        lastSpawnTime = System.currentTimeMillis()
-                        Log.i("GameReset", "Game reset. Pool size: ${bottlePool.size}")
-                    }) {
-                        Text("Play Again")
+                    Button(
+                        onClick = {
+                            gameSurfaceView.value?.resetGame() // Call reset on the view instance
+                            intensitySliderValue = 1f // Reset slider UI state
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Text("Play Again", fontSize = 18.sp)
                     }
                 }
-                Spacer(modifier = Modifier.weight(1f))
             }
-        } // End UI Column
-
+        }
     } // End Root Box
-} // End GameScreen
-
-
-// --- Simple Theme (unchanged) ---
-@Composable
-fun SodaPopBurstTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = lightColorScheme(
-            primary = Color(0xFF6200EE),
-            secondary = Color(0xFF03DAC6),
-            tertiary = Color(0xFF3700B3)
-        ),
-        typography = Typography(),
-        shapes = Shapes(),
-        content = content
-    )
-}
-
-// --- Game State Enum (unchanged) ---
-enum class GameState {
-    PLAYING,
-    GAME_OVER
 }

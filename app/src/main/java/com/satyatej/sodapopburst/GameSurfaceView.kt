@@ -2,131 +2,336 @@ package com.satyatej.sodapopburst
 
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color as AndroidColor // Alias to avoid clash with Compose Color
-import android.graphics.Paint
+import android.graphics.Color as AndroidColor // Use alias to avoid clash with Compose Color
+import android.graphics.Paint // Import Android Paint
 import android.graphics.PorterDuff
 import android.graphics.RectF
 import android.util.AttributeSet
 import android.util.Log
-import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import androidx.compose.ui.geometry.Offset // Keep for touch offset type if needed elsewhere
-import androidx.compose.ui.geometry.Rect // Keep for rect type if needed elsewhere
-import androidx.compose.ui.graphics.Color
 import kotlinx.coroutines.*
-import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlin.math.max
 import kotlin.random.Random
+import kotlin.system.measureTimeMillis
 
-// Re-define Bottle here or move to a separate file if preferred
-// Using vars for pooling, added active flag
+// Assuming GameState is defined elsewhere (e.g., MainActivity or shared file)
+// enum class GameState { PLAYING, GAME_OVER }
+
+// --- Bottle Definition (for SurfaceView) ---
 data class GameBottle(
     var id: Long = 0,
     var xPercent: Float = 0f, // Position as percentage of width
     var yPx: Float = 0f,      // Position in pixels from top
     var color: Int = AndroidColor.TRANSPARENT, // Use Android Color Int
-    var speedFactor: Float = 1f,
-    var active: Boolean = false
+    var speedFactorPxPerSec: Float = 0f, // Store actual speed in pixels/sec
+    var active: Boolean = false,
+    var widthPx: Float = 0f, // Store size for collision/drawing
+    var heightPx: Float = 0f // Store size for collision/drawing
 ) {
-    fun reset(startXPercent: Float, startYPx: Float, startColorInt: Int) {
-        id = System.nanoTime() // Keep simple ID for now
+    // Reset function now takes necessary parameters including calculated sizes and speed
+    fun reset(startXPercent: Float, startYPx: Float, startColorInt: Int, bottleW: Float, bottleH: Float, baseSpeedPx: Float) {
+        id = System.nanoTime() // Simple ID
         xPercent = startXPercent
         yPx = startYPx
         color = startColorInt
-        speedFactor = Random.nextFloat() * 0.5f + 0.8f
+        widthPx = bottleW
+        heightPx = bottleH
+        // Calculate and store actual speed for this bottle
+        speedFactorPxPerSec = (Random.nextFloat() * 0.5f + 0.8f) * baseSpeedPx
         active = true
+        // Log.d("GameBottle", "Resetting Bottle $id: y=$startYPx, speed=${speedFactorPxPerSec}px/s (base=$baseSpeedPx)")
+    }
+
+    // Update position based on delta time, return false if off-screen (missed)
+    fun update(deltaTimeSec: Float, viewHeight: Int): Boolean {
+        if (!active) return true // Don't update inactive bottles
+        yPx += speedFactorPxPerSec * deltaTimeSec
+        // Check miss condition (top edge is off screen - using top edge yPx - heightPx/2)
+        if (yPx - heightPx / 2 > viewHeight) {
+            active = false // Mark as inactive immediately
+            return false
+        }
+        return true // Still active/visible
+    }
+
+    // Get the drawing rectangle for this bottle (centered)
+    fun getRect(viewWidth: Int): RectF {
+        val currentXPx = xPercent * viewWidth + widthPx / 2 // Adjust X to be centered based on %
+        return RectF(
+            currentXPx - widthPx / 2,
+            yPx - heightPx / 2,
+            currentXPx + widthPx / 2,
+            yPx + heightPx / 2
+        )
     }
 }
 
 
+// --- GameSurfaceView Implementation ---
 class GameSurfaceView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
     defStyleAttr: Int = 0
-) : SurfaceView(context, attrs, defStyleAttr), SurfaceHolder.Callback, CoroutineScope {
+) : SurfaceView(context, attrs, defStyleAttr), SurfaceHolder.Callback {
 
-    private val job = Job()
-    override val coroutineContext: CoroutineContext = Dispatchers.Default + job // Use Default dispatcher for game loop
+    // Coroutine scope tied to the Default dispatcher for background work
+    private val gameCoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var gameLoopJob: Job? = null // The Job for the main game loop
 
-    private var gameThread: Job? = null
-    private val bottlePaint = Paint().apply { isAntiAlias = true }
-    private val backgroundPaint = Paint().apply { color = AndroidColor.DKGRAY } // Simple background
+    // --- State Flows for UI Communication ---
+    private val _scoreFlow = MutableStateFlow(0)
+    val scoreFlow: StateFlow<Int> = _scoreFlow
 
-    // --- Game State (managed within the view for this example) ---
+    private val _gameStateFlow = MutableStateFlow(GameState.PLAYING) // Start in PLAYING state
+    val gameStateFlow: StateFlow<GameState> = _gameStateFlow
+
+    // --- Game State Variables ---
     private val activeBottles = mutableListOf<GameBottle>()
     private val bottlePool = mutableListOf<GameBottle>() // Object Pool
-    private var lastSpawnTime = 0L
+    @Volatile private var isSurfaceReady = false
     private var viewWidth = 0
     private var viewHeight = 0
-    private var bottleWidthPx = 80f // Example size, adjust as needed
-    private var bottleHeightPx = 160f // Example size, adjust as needed
-    private var baseSpeedPxPerSec = 120f // Example speed, adjust as needed
-    private var initialBottleOffsetYPx = -160f // Example offset
+    private var lastSpawnTimeMs = 0L
 
-    // Predefined Android colors
+    // --- Configuration ---
+    private val targetFps = 60 // Target frame rate
+    private val targetFrameTimeMillis = 1000L / targetFps
+    private val baseSpeedDpPerSec = 100f // Base speed in DP/s
+    private var baseSpeedPxPerSec = 0f
+    private val bottleWidthDp = 40f
+    private val bottleHeightDp = 80f
+    private var bottleWidthPx = 0f
+    private var bottleHeightPx = 0f
+    private var initialBottleOffsetYPx = 0f
+    private var spawnDelayMillis = 1000L // Initial spawn delay
+    @Volatile private var intensity = 1f // Game intensity affecting speed/spawn - volatile for thread safety
+
+    // --- Drawing ---
+    private val bottlePaint = Paint().apply { isAntiAlias = true }
+    private val backgroundPaint = Paint().apply { color = AndroidColor.DKGRAY } // Default background
+
+    // --- Colors ---
     private val androidSodaColors = listOf(
-        AndroidColor.parseColor("#FFE53935"), // Red
-        AndroidColor.parseColor("#FF43A047"), // Green
-        AndroidColor.parseColor("#FF1E88E5"), // Blue
-        AndroidColor.parseColor("#FFFDD835"), // Yellow
-        AndroidColor.parseColor("#FF8E24AA"), // Purple
-        AndroidColor.parseColor("#FFFF7043")  // Orange
+        AndroidColor.parseColor("#FFE53935"), AndroidColor.parseColor("#FF43A047"),
+        AndroidColor.parseColor("#FF1E88E5"), AndroidColor.parseColor("#FFFDD835"),
+        AndroidColor.parseColor("#FF8E24AA"), AndroidColor.parseColor("#FFFF7043")
     )
 
-    // State Flows for communicating with Compose UI
-    val scoreFlow = kotlinx.coroutines.flow.MutableStateFlow(0)
-    val gameStateFlow = kotlinx.coroutines.flow.MutableStateFlow(GameState.PLAYING) // Assuming GameState enum exists
-    var intensity = 1f // Can be updated from Compose if needed (e.g., via a function)
+    // --- Lambdas for Sound (to be set from outside) ---
+    var playBurstSound: () -> Unit = { Log.w("GameSurfaceView", "playBurstSound not set") }
+    var playMissSound: () -> Unit = { Log.w("GameSurfaceView", "playMissSound not set") }
 
-    // --- Touch Handling ---
-    // Expose a function to be called from Compose's touch input
-    fun handleTap(touchXPx: Float, touchYPx: Float) {
-        if (gameStateFlow.value == GameState.PLAYING) {
-            var bottleTapped = false
-            // Iterate backwards for safe removal
-            for (i in activeBottles.indices.reversed()) {
-                val bottle = activeBottles[i]
-                val bottleXPx = bottle.xPercent * viewWidth
-                val bottleYPx = bottle.yPx
+    init {
+        holder.addCallback(this)
+        isFocusable = true
+        Log.d("GameSurfaceView", "Init")
+        // Calculate initial pixel values based on density
+        calculateDimensions(resources.displayMetrics.density)
+    }
 
-                // Simple Rect check for tap
-                val tapCheckRect = RectF(
-                    bottleXPx,
-                    bottleYPx,
-                    bottleXPx + bottleWidthPx,
-                    bottleYPx + bottleHeightPx
-                )
-                // Expand tap area slightly for easier tapping
-                val expandedTapRect = RectF(
-                    tapCheckRect.left - bottleWidthPx * 0.2f,
-                    tapCheckRect.top - bottleHeightPx * 0.2f,
-                    tapCheckRect.right + bottleWidthPx * 0.2f,
-                    tapCheckRect.bottom + bottleHeightPx * 0.2f
-                )
+    private fun calculateDimensions(density: Float) {
+        baseSpeedPxPerSec = baseSpeedDpPerSec * density
+        bottleWidthPx = bottleWidthDp * density
+        bottleHeightPx = bottleHeightDp * density
+        initialBottleOffsetYPx = -bottleHeightPx // Start with top edge just off screen
+        Log.d("GameSurfaceView", "Calculated Dims: BaseSpeed=${baseSpeedPxPerSec}px/s, BottleW=${bottleWidthPx}px, BottleH=${bottleHeightPx}px")
+
+    }
+
+    // --- Game Loop Management ---
+    private fun startGameLoop() {
+        if (gameLoopJob?.isActive == true) {
+            Log.w("GameSurfaceView", "Attempted to start loop, but already running.")
+            return
+        }
+        if (!isSurfaceReady) {
+            Log.w("GameSurfaceView", "Surface not ready, cannot start loop.")
+            return
+        }
+        if (gameStateFlow.value == GameState.GAME_OVER) {
+            Log.w("GameSurfaceView", "Attempting to start loop but game is over. Reset first.")
+            return // Must call resetGame() externally before starting
+        }
 
 
-                if (expandedTapRect.contains(touchXPx, touchYPx)) {
-                    Log.i("GameSurfaceViewTap", ">>> SUCCESSFUL TAP on Bottle ID ${bottle.id}")
-                    releaseBottle(bottle) // Return to pool
-                    activeBottles.removeAt(i) // Remove from active list
-                    scoreFlow.value += 1 // Update score via flow
-                    // TODO: Play burst sound (needs SoundPool instance passed in or managed differently)
-                    bottleTapped = true
-                    break // Exit loop once a bottle is hit
+        gameLoopJob = gameCoroutineScope.launch {
+            Log.i("GameSurfaceView", "Starting game loop...")
+            var lastFrameTimeNanos = System.nanoTime() // Use var here
+
+            while (isActive && gameStateFlow.value == GameState.PLAYING) { // Check state each iteration
+                if (!isSurfaceReady) {
+                    Log.w("GameSurfaceView", "Surface became invalid during loop.")
+                    break // Exit loop
+                }
+
+                val currentTimeNanos = System.nanoTime()
+                // Prevent negative delta on first frame after resume/reset
+                val deltaTimeNanos = (currentTimeNanos - lastFrameTimeNanos).coerceAtLeast(0)
+                lastFrameTimeNanos = currentTimeNanos // lastFrameTimeNanos is updated, so it must be var
+                // Clamp delta time to prevent extreme jumps if system lags
+                val deltaTimeSec = (deltaTimeNanos / 1_000_000_000.0f).coerceIn(0.001f, 0.05f)
+
+                // --- Update ---
+                updateGameState(deltaTimeSec)
+
+                // Check again if game ended during update
+                if (gameStateFlow.value != GameState.PLAYING) break
+
+                // --- Draw ---
+                val drawTimeMillis = measureTimeMillis { // drawTimeMillis is val, not reassigned
+                    drawGame(holder) // Pass holder explicitly
+                }
+
+                // --- Frame Pacing ---
+                val cycleTimeMillis = deltaTimeNanos / 1_000_000 // val, not reassigned
+                val sleepTimeMillis = targetFrameTimeMillis - cycleTimeMillis // val, not reassigned
+                // Log.d("GameSurfaceView", "Cycle: ${cycleTimeMillis}ms, Draw: ${drawTimeMillis}ms, Sleep: ${sleepTimeMillis}ms")
+
+                if (sleepTimeMillis > 0) {
+                    delay(sleepTimeMillis)
+                } else {
+                    // Barely missed target or no time to sleep, yield immediately
+                    yield()
                 }
             }
-            if (!bottleTapped) { Log.d("GameSurfaceViewTap", "--- Tap missed") }
+            Log.i("GameSurfaceView", "Game loop exited. Final State: ${gameStateFlow.value}")
+        }
+        gameLoopJob?.invokeOnCompletion { throwable ->
+            if (throwable != null && throwable !is CancellationException) {
+                Log.e("GameSurfaceView", "Game loop crashed", throwable)
+                // Potentially set game state to error or try to recover
+                _gameStateFlow.value = GameState.GAME_OVER // Go to game over on crash
+            } else {
+                Log.i("GameSurfaceView", "Game loop completed or cancelled normally.")
+            }
         }
     }
 
-    // --- Object Pooling Functions ---
-    private fun obtainBottle(): GameBottle {
-        return if (bottlePool.isNotEmpty()) {
-            bottlePool.removeLast()
-        } else {
-            GameBottle()
+    private fun stopGameLoop() {
+        if (gameLoopJob == null) return // Already stopped
+        Log.i("GameSurfaceView", "Requesting game loop stop...")
+        gameLoopJob?.cancel() // Request cancellation
+        gameLoopJob = null
+    }
+
+    // --- State Update ---
+    private fun updateGameState(deltaTimeSec: Float) {
+        if (viewHeight <= 0 || viewWidth <= 0) return // View not measured yet
+
+        // Update existing bottles
+        val iterator = activeBottles.listIterator()
+        var missed = false // Use var
+        while (iterator.hasNext()) {
+            val bottle = iterator.next()
+            if (!bottle.update(deltaTimeSec, viewHeight)) {
+                // Bottle missed (went off screen)
+                Log.d("GameSurfaceView", "Bottle ${bottle.id} Missed!")
+                iterator.remove()
+                releaseBottle(bottle)
+                missed = true // Reassign var
+            }
         }
+
+        if (missed) { // Only trigger game over if a bottle was missed *this frame*
+            Log.w("GameSurfaceView", "Game Over triggered by missed bottle.")
+            _gameStateFlow.value = GameState.GAME_OVER // Update StateFlow
+            playMissSound() // Play sound via lambda
+            stopGameLoop() // Stop the game loop
+            return // Don't spawn new bottles if game just ended
+        }
+
+        // Spawn New Bottles if still playing
+        spawnDelayMillis = max(150L, (1000 - intensity * 80).toLong()) // Dynamic spawn rate
+        val currentTimeMs = System.currentTimeMillis()
+        if (currentTimeMs - lastSpawnTimeMs > spawnDelayMillis) {
+            spawnBottle()
+            lastSpawnTimeMs = currentTimeMs // lastSpawnTimeMs is var
+        }
+    }
+
+    private fun spawnBottle() {
+        if (viewWidth <= 0) return // Cannot calculate position
+
+        val bottle = obtainBottle()
+        val effectiveBottleWidth = bottleWidthPx
+
+        // Ensure xPercent keeps the entire bottle on screen horizontally (center point based)
+        val halfWidthPercent = (effectiveBottleWidth / 2f) / viewWidth
+        val maxSpawnXPercent = (1.0f - halfWidthPercent)
+        val minSpawnXPercent = halfWidthPercent
+        val spawnXPercent = Random.nextFloat().coerceIn(minSpawnXPercent, maxSpawnXPercent)
+
+
+        val currentIntensitySpeed = baseSpeedPxPerSec * (1f + (intensity / 10f) * 2f)
+
+        bottle.reset(
+            startXPercent = spawnXPercent,
+            startYPx = initialBottleOffsetYPx + bottleHeightPx / 2, // Start position (center Y)
+            startColorInt = androidSodaColors.random(),
+            bottleW = effectiveBottleWidth,
+            bottleH = bottleHeightPx,
+            baseSpeedPx = currentIntensitySpeed // Pass current speed calculation
+        )
+        activeBottles.add(bottle)
+    }
+
+    // --- Drawing ---
+    private fun drawGame(holder: SurfaceHolder) { // Receive holder
+        val canvas: Canvas? = try {
+            holder.lockCanvas() // Lock canvas on the holder
+        } catch (e: IllegalArgumentException){
+            Log.e("GameSurfaceView", "Failed to lock canvas. Surface might be invalid.", e)
+            null
+        } catch (e: Exception) {
+            Log.e("GameSurfaceView", "Unknown error locking canvas", e)
+            null
+        }
+
+        if (canvas == null) {
+            if (isSurfaceReady) Log.w("GameSurfaceView", "Canvas lock returned null unexpectedly.")
+            return // Couldn't get canvas, skip drawing
+        }
+
+        try {
+            // 1. Clear background
+            canvas.drawColor(AndroidColor.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            canvas.drawRect(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat(), backgroundPaint)
+
+            // 2. Draw Bottles
+            val bottleCount = activeBottles.size
+            for (i in 0 until bottleCount) {
+                // Check index just in case (belt and suspenders)
+                if (i >= activeBottles.size) break
+                val bottle = activeBottles[i]
+                val rect = bottle.getRect(viewWidth) // Get bottle bounds (centered)
+
+                // Simple culling check (optional)
+                if (RectF.intersects(rect, RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat()))) {
+                    bottlePaint.color = bottle.color
+                    canvas.drawRect(rect, bottlePaint)
+                }
+            }
+        } finally {
+            try {
+                holder.unlockCanvasAndPost(canvas) // Unlock on the same holder
+            } catch (e: IllegalStateException){
+                Log.e("GameSurfaceView", "Failed to unlock/post canvas. Surface might have been released.", e)
+                // Surface is likely invalid now, ensure loop stops if running
+                isSurfaceReady = false
+                stopGameLoop()
+            } catch (e: Exception) {
+                Log.e("GameSurfaceView", "Unknown error unlocking/posting canvas", e)
+            }
+        }
+    }
+
+    // --- Object Pooling ---
+    private fun obtainBottle(): GameBottle {
+        // Fixed: Use removeAt(lastIndex) for API level compatibility
+        return if (bottlePool.isNotEmpty()) bottlePool.removeAt(bottlePool.lastIndex) else GameBottle()
     }
 
     private fun releaseBottle(bottle: GameBottle) {
@@ -134,201 +339,87 @@ class GameSurfaceView @JvmOverloads constructor(
         bottlePool.add(bottle)
     }
 
-    init {
-        holder.addCallback(this)
-        isFocusable = true // Ensure view can receive focus/touch events if needed directly (though we'll use Compose input)
-        Log.d("GameSurfaceView", "Init")
+    // --- Public Control Functions ---
+    fun handleTap(touchXPx: Float, touchYPx: Float) {
+        if (gameStateFlow.value != GameState.PLAYING) return
+
+        gameCoroutineScope.launch {
+            var bottleTapped = false
+            for (i in activeBottles.indices.reversed()) {
+                if (i >= activeBottles.size) continue
+                val bottle = activeBottles[i]
+                val bottleRect = bottle.getRect(viewWidth)
+
+                // Slightly expand the tap area
+                val expandedTapRect = RectF(bottleRect)
+                expandedTapRect.inset(-bottle.widthPx * 0.2f, -bottle.heightPx * 0.2f)
+
+                if (expandedTapRect.contains(touchXPx, touchYPx)) {
+                    Log.i("GameSurfaceViewTap", ">>> TAP on Bottle ID ${bottle.id}")
+                    activeBottles.removeAt(i)
+                    releaseBottle(bottle)
+                    _scoreFlow.value += 1
+                    playBurstSound()
+                    bottleTapped = true
+                    break
+                }
+            }
+        }
     }
 
+    fun updateIntensity(newIntensity: Float) {
+        this.intensity = newIntensity.coerceIn(0f, 10f)
+    }
+
+    fun resetGame() {
+        gameCoroutineScope.launch {
+            Log.i("GameSurfaceView", "Resetting Game State...")
+            stopGameLoop()
+            _scoreFlow.value = 0
+            intensity = 1f
+            activeBottles.forEach { releaseBottle(it) }
+            activeBottles.clear()
+            _gameStateFlow.value = GameState.PLAYING
+            lastSpawnTimeMs = System.currentTimeMillis()
+            Log.i("GameSurfaceView", "Game reset complete. Pool size: ${bottlePool.size}")
+            if (isSurfaceReady) {
+                startGameLoop()
+            } else {
+                Log.w("GameSurfaceView", "Reset game, but surface not ready to restart loop.")
+            }
+        }
+    }
+
+    fun cleanup() {
+        Log.d("GameSurfaceView", "Cleaning up GameSurfaceView scope and loop")
+        stopGameLoop()
+        gameCoroutineScope.cancel()
+    }
+
+    // --- SurfaceHolder Callbacks ---
     override fun surfaceCreated(holder: SurfaceHolder) {
-        Log.d("GameSurfaceView", "Surface Created")
-        if (gameThread == null) {
-            startGameLoop(holder)
+        Log.i("GameSurfaceView", "Surface Created")
+        isSurfaceReady = true
+        if (_gameStateFlow.value == GameState.PLAYING) {
+            startGameLoop()
         }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        Log.d("GameSurfaceView", "Surface Changed: w=$width, h=$height")
+        Log.i("GameSurfaceView", "Surface Changed: w=$width, h=$height")
+        val oldWidth = viewWidth
+        val oldHeight = viewHeight
         viewWidth = width
         viewHeight = height
-        // Update bottle sizes based on view size (example: make them relative)
-        bottleWidthPx = width / 10f // Example: Bottle width is 1/10th of screen width
-        bottleHeightPx = bottleWidthPx * 2 // Example: Bottle height is twice its width
-        initialBottleOffsetYPx = -bottleHeightPx // Start fully off-screen
-        baseSpeedPxPerSec = height / 5f // Example: Takes 5 seconds to cross the screen at base speed
-
-        // Optionally restart loop if needed, but usually handled by surfaceCreated/Destroyed
-        // stopGameLoop()
-        // startGameLoop(holder)
+        if (width != oldWidth || height != oldHeight) {
+            calculateDimensions(resources.displayMetrics.density)
+        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        Log.d("GameSurfaceView", "Surface Destroyed")
+        Log.i("GameSurfaceView", "Surface Destroyed")
+        isSurfaceReady = false
         stopGameLoop()
-    }
-
-    fun resetGame() {
-        Log.i("GameSurfaceView", "Resetting Game")
-        scoreFlow.value = 0
-        intensity = 1f // Reset intensity if controlled here
-        // Clear active bottles and return them to the pool
-        activeBottles.forEach { releaseBottle(it) }
-        activeBottles.clear()
-        gameStateFlow.value = GameState.PLAYING
-        lastSpawnTime = System.currentTimeMillis() // Reset spawn timer
-        Log.i("GameSurfaceView", "Game reset complete. Pool size: ${bottlePool.size}")
-        // Ensure game loop restarts if it was stopped by game over
-        if (gameThread == null || gameThread?.isActive == false) {
-            startGameLoop(holder)
-        }
-    }
-
-    private fun startGameLoop(holder: SurfaceHolder) {
-        Log.i("GameSurfaceView", "Starting Game Loop")
-        if (gameStateFlow.value == GameState.GAME_OVER) {
-            Log.w("GameSurfaceView", "Attempted to start loop while game over, resetting.")
-            resetGame() // Ensure we are in a playable state before starting
-        }
-        gameThread = launch { // Launch coroutine on the CoroutineScope's context (Default dispatcher)
-            var lastFrameTimeNanos = System.nanoTime()
-
-            while (isActive && gameStateFlow.value == GameState.PLAYING) {
-                val nowNanos = System.nanoTime()
-                val deltaTime = (nowNanos - lastFrameTimeNanos).coerceAtLeast(0) / 1_000_000_000.0f // Prevent negative delta on first frame/resets
-                lastFrameTimeNanos = nowNanos
-
-                // --- Update ---
-                updateGame(deltaTime)
-
-                // --- Draw ---
-                var canvas: Canvas? = null
-                try {
-                    canvas = holder.lockCanvas()
-                    if (canvas != null) {
-                        synchronized(holder) { // Synchronize drawing
-                            drawGame(canvas)
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e("GameSurfaceView", "Error locking/drawing canvas", e)
-                } finally {
-                    if (canvas != null) {
-                        try {
-                            holder.unlockCanvasAndPost(canvas)
-                        } catch (e: Exception) {
-                            Log.e("GameSurfaceView", "Error unlocking canvas", e)
-                        }
-                    }
-                }
-
-                // --- Frame Limiting (Optional but recommended) ---
-                // Simple busy-wait loop for more precise timing, but can consume CPU.
-                // val targetFrameTimeNanos = 1_000_000_000 / 60 // Target 60 FPS
-                // val timeSpentNanos = System.nanoTime() - nowNanos
-                // val timeToWaitNanos = (targetFrameTimeNanos - timeSpentNanos).coerceAtLeast(0)
-                // if (timeToWaitNanos > 0) {
-                //     delay(timeToWaitNanos / 1_000_000) // Delay in milliseconds
-                // }
-                // Or simpler delay:
-                delay(16) // Roughly targets 60 FPS, less precise
-
-            }
-            Log.i("GameSurfaceView", "Game Loop Ended. State: ${gameStateFlow.value}")
-        } // End launch
-    }
-
-    private fun stopGameLoop() {
-        Log.i("GameSurfaceView", "Stopping Game Loop")
-        gameThread?.cancel() // Request cancellation of the coroutine
-        gameThread = null
-    }
-
-    private fun updateGame(deltaTime: Float) {
-        if (viewHeight <= 0 || viewWidth <= 0) return // Ensure view is ready
-
-        // Check Game Over state first
-        if (gameStateFlow.value != GameState.PLAYING) {
-            return
-        }
-
-        val speedMultiplier = 1f + (intensity / 10f) * 4f
-        val fallSpeedPx = baseSpeedPxPerSec * speedMultiplier * deltaTime
-
-        // Update Bottle Positions using ListIterator for safe removal during iteration
-        val iterator = activeBottles.listIterator()
-        while (iterator.hasNext()) {
-            val bottle = iterator.next()
-            bottle.yPx += fallSpeedPx * bottle.speedFactor
-
-            // Check miss condition
-            if (bottle.yPx > viewHeight) {
-                Log.d("GameSurfaceView", "Bottle ${bottle.id} missed")
-                iterator.remove() // Remove from active list
-                releaseBottle(bottle) // Return to pool
-                // TODO: Play miss sound
-                gameStateFlow.value = GameState.GAME_OVER // Update state via flow
-                stopGameLoop() // Stop the loop on game over
-                break // Exit update loop
-            }
-        }
-
-        // Spawn New Bottles only if playing
-        if (gameStateFlow.value == GameState.PLAYING) {
-            val spawnDelayMillis = max(200L, (1500 - intensity * 120).toLong())
-            if (System.currentTimeMillis() - lastSpawnTime > spawnDelayMillis) {
-                val randomXPercent = Random.nextFloat()
-                // Ensure xPercent stays within 0.0 to (1.0 - bottleWidth/viewWidth)
-                val maxSpawnXPercent = 1.0f - (bottleWidthPx / viewWidth)
-                val spawnXPercent = (randomXPercent * maxSpawnXPercent).coerceAtLeast(0f)
-
-                val bottle = obtainBottle()
-                bottle.reset(
-                    startXPercent = spawnXPercent,
-                    startYPx = initialBottleOffsetYPx,
-                    startColorInt = androidSodaColors.random()
-                )
-                activeBottles.add(bottle)
-                lastSpawnTime = System.currentTimeMillis()
-            }
-        }
-    }
-
-    private fun drawGame(canvas: Canvas) {
-        // 1. Clear background
-        canvas.drawColor(AndroidColor.BLACK, PorterDuff.Mode.CLEAR) // Clear previous frame
-        canvas.drawRect(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat(), backgroundPaint) // Draw background color
-
-        // 2. Draw Bottles
-        val bottleCount = activeBottles.size
-        for (i in 0 until bottleCount) {
-            // Check index validity in case of concurrent modification (less likely with synchronized block)
-            if (i >= activeBottles.size) break
-            val bottle = activeBottles[i]
-
-            val drawX = bottle.xPercent * viewWidth
-            val drawY = bottle.yPx
-
-            // Simple visibility check (drawing items off-screen is generally okay, but can cull if needed)
-            // if (drawY < viewHeight + bottleHeightPx && drawY > -bottleHeightPx * 2) {
-            bottlePaint.color = bottle.color
-            canvas.drawRect(
-                drawX,
-                drawY,
-                drawX + bottleWidthPx,
-                drawY + bottleHeightPx,
-                bottlePaint
-            )
-            // }
-        }
-        // Log.d("GameSurfaceView", "Drew $bottleCount bottles")
-    }
-
-    // Optional: Call this when the Activity/Fragment is destroyed to clean up the coroutine scope
-    fun cleanup() {
-        Log.d("GameSurfaceView", "Cleaning up CoroutineScope")
-        job.cancel() // Cancel the scope's job, cancelling the game loop if running
     }
 }
 
-// Assuming GameState enum exists from MainActivity or is moved to a shared file
-// enum class GameState { PLAYING, GAME_OVER }
