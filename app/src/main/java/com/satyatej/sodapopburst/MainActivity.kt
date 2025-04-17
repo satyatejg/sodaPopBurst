@@ -78,14 +78,14 @@ class MainActivity : ComponentActivity() {
     // Added soundName parameter for logging
     private fun playSound(soundId: Int, soundName: String) {
         if (soundPool == null) {
-            Log.e("MainActivity", "SoundPool not initialized when trying to play $soundName ($soundId)")
-            return
+             Log.e("MainActivity", "SoundPool not initialized when trying to play $soundName ($soundId)")
+             return
         }
         if (soundId != 0) {
             val streamId = soundPool?.play(soundId, 0.8f, 0.8f, 1, 0, 1f)
             Log.d("MainActivity", "Playing sound '$soundName' (ID: $soundId, Stream: $streamId)")
             if (streamId == 0) {
-                Log.e("MainActivity", "Failed to play sound '$soundName' (ID: $soundId) - play() returned 0")
+                 Log.e("MainActivity", "Failed to play sound '$soundName' (ID: $soundId) - play() returned 0")
             }
         } else {
             Log.w("MainActivity", "Attempted to play sound '$soundName' but ID is 0")
@@ -139,8 +139,8 @@ fun GameScreenWithSurfaceView(
         onDispose {
             Log.d("MainActivityComposable", "onDispose - Removing observer")
             lifecycleOwner.lifecycle.removeObserver(observer)
-            // Cleanup might be called here too if composable disposes before Activity
-            // view?.cleanup() // Optional: depends on desired cleanup timing
+             // Cleanup might be called here too if composable disposes before Activity
+             // view?.cleanup() // Optional: depends on desired cleanup timing
         }
     }
 
@@ -196,12 +196,12 @@ fun GameScreenWithSurfaceView(
                         }
                     },
                     modifier = Modifier.fillMaxSize(),
-                    // Add this update block to ensure sounds are passed if view recomposes
-                    update = { view ->
-                        Log.d("AndroidView", "Update block called, re-assigning sound lambdas")
-                        view.playBurstSound = playBurstSound
-                        view.playMissSound = playMissSound
-                    }
+                     // Add this update block to ensure sounds are passed if view recomposes
+                     update = { view ->
+                         Log.d("AndroidView", "Update block called, re-assigning sound lambdas")
+                         view.playBurstSound = playBurstSound
+                         view.playMissSound = playMissSound
+                     }
                 )
             }
 
@@ -230,8 +230,8 @@ fun GameScreenWithSurfaceView(
                     )
                 }
             } else {
-                // Reserve space for the slider when game is over to prevent layout jumps
-                Spacer(modifier = Modifier.height(56.dp).fillMaxWidth()) // Adjust height as needed
+                 // Reserve space for the slider when game is over to prevent layout jumps
+                 Spacer(modifier = Modifier.height(56.dp).fillMaxWidth()) // Adjust height as needed
             }
         } // End Column
 
@@ -256,12 +256,12 @@ fun GameScreenWithSurfaceView(
                     Spacer(modifier = Modifier.height(24.dp))
                     Button(
                         onClick = {
-                            // Call reset only if view reference exists
-                            gameSurfaceView.value?.resetGame()
-                            intensitySliderValue = 1f // Reset slider UI state
+                             // Call reset only if view reference exists
+                             gameSurfaceView.value?.resetGame()
+                             intensitySliderValue = 1f // Reset slider UI state
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                    ) {
+                        ) {
                         Text("Play Again", fontSize = 18.sp)
                     }
                 }
@@ -269,4 +269,3 @@ fun GameScreenWithSurfaceView(
         }
     } // End Root Box
 }
-
