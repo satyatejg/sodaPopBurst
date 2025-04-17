@@ -52,8 +52,8 @@ class MainActivity : ComponentActivity() {
 
                 // --- Main Game Screen ---
                 GameScreenWithSurfaceView(
-                    playBurstSound = { playSound(burstSoundId) },
-                    playMissSound = { playSound(missSoundId) }
+                    playBurstSound = { playSound(burstSoundId, "Burst") }, // Pass name for logging
+                    playMissSound = { playSound(missSoundId, "Miss") }    // Pass name for logging
                 )
             }
         }
@@ -66,6 +66,7 @@ class MainActivity : ComponentActivity() {
         try {
             burstSoundId = soundPool!!.load(this, R.raw.burst_sound, 1)
             missSoundId = soundPool!!.load(this, R.raw.miss_sound, 1)
+            // Optional: Add OnLoadCompleteListener if needed for more complex scenarios
             Log.d("MainActivity", "Sounds loaded: Burst=$burstSoundId, Miss=$missSoundId")
         } catch (e: Exception) {
             Log.e("MainActivity", "Failed to load sounds", e)
@@ -74,13 +75,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun playSound(soundId: Int) {
+    // Added soundName parameter for logging
+    private fun playSound(soundId: Int, soundName: String) {
+        if (soundPool == null) {
+            Log.e("MainActivity", "SoundPool not initialized when trying to play $soundName ($soundId)")
+            return
+        }
         if (soundId != 0) {
-            soundPool?.play(soundId, 0.8f, 0.8f, 1, 0, 1f) // Slightly lower volume
+            val streamId = soundPool?.play(soundId, 0.8f, 0.8f, 1, 0, 1f)
+            Log.d("MainActivity", "Playing sound '$soundName' (ID: $soundId, Stream: $streamId)")
+            if (streamId == 0) {
+                Log.e("MainActivity", "Failed to play sound '$soundName' (ID: $soundId) - play() returned 0")
+            }
         } else {
-            Log.w("MainActivity", "Attempted to play sound with ID 0")
+            Log.w("MainActivity", "Attempted to play sound '$soundName' but ID is 0")
         }
     }
+
 
     private fun releaseSoundPool() {
         soundPool?.release()
@@ -104,8 +115,9 @@ fun GameScreenWithSurfaceView(
     val gameSurfaceView = remember { mutableStateOf<GameSurfaceView?>(null) }
 
     // --- State Collection ---
-    val score by gameSurfaceView.value?.scoreFlow?.collectAsState() ?: remember { mutableStateOf(0) }
-    val gameState by gameSurfaceView.value?.gameStateFlow?.collectAsState() ?: remember { mutableStateOf(GameState.PLAYING) } // Default to PLAYING initially
+    // Collect state flows from the GameSurfaceView instance safely
+    val score by gameSurfaceView.value?.scoreFlow?.collectAsState() ?: remember { mutableStateOf(0) } // Default if view is null
+    val gameState by gameSurfaceView.value?.gameStateFlow?.collectAsState() ?: remember { mutableStateOf(GameState.PLAYING) } // Default if view is null
 
     // Local UI state for the intensity slider
     var intensitySliderValue by remember { mutableStateOf(1f) }
@@ -135,21 +147,16 @@ fun GameScreenWithSurfaceView(
 
     // --- Effect to update GameSurfaceView's intensity when slider changes ---
     LaunchedEffect(intensitySliderValue, gameSurfaceView.value) {
+        // Only update if the view exists
         gameSurfaceView.value?.updateIntensity(intensitySliderValue)
     }
 
     // --- UI Layout ---
     Box(modifier = Modifier.fillMaxSize()) { // Layer background and game elements
 
-        // 1. Background Image
-        Image(
-            painter = painterResource(id = R.drawable.game_background),
-            contentDescription = "Game Background",
-            modifier = Modifier.fillMaxSize(),
-            contentScale = ContentScale.Crop
-        )
+        // Background Image is drawn INSIDE the SurfaceView now
 
-        // 2. Game Area and UI Overlay Column
+        // Game Area and UI Overlay Column
         Column(
             modifier = Modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -162,7 +169,7 @@ fun GameScreenWithSurfaceView(
                 color = Color.White,
                 modifier = Modifier
                     .padding(top = 16.dp)
-                    .background(Color.Black.copy(alpha = 0.5f), shape = MaterialTheme.shapes.medium)
+                    .background(Color.Black.copy(alpha = 0.5f), MaterialTheme.shapes.medium)
                     .padding(horizontal = 12.dp, vertical = 4.dp)
             )
 
@@ -173,7 +180,8 @@ fun GameScreenWithSurfaceView(
                     .weight(1f) // Takes up available space
                     .pointerInput(Unit) { // Handle taps within this Box
                         detectTapGestures {
-                            gameSurfaceView.value?.handleTap(it.x, it.y) // Pass offset x, y
+                            // Pass tap coordinates only if the view reference is not null
+                            gameSurfaceView.value?.handleTap(it.x, it.y)
                         }
                     }
             ) {
@@ -188,6 +196,12 @@ fun GameScreenWithSurfaceView(
                         }
                     },
                     modifier = Modifier.fillMaxSize(),
+                    // Add this update block to ensure sounds are passed if view recomposes
+                    update = { view ->
+                        Log.d("AndroidView", "Update block called, re-assigning sound lambdas")
+                        view.playBurstSound = playBurstSound
+                        view.playMissSound = playMissSound
+                    }
                 )
             }
 
@@ -198,7 +212,7 @@ fun GameScreenWithSurfaceView(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 8.dp)
-                        .background(Color.Black.copy(alpha = 0.5f), shape = MaterialTheme.shapes.medium)
+                        .background(Color.Black.copy(alpha = 0.5f), MaterialTheme.shapes.medium)
                         .padding(horizontal = 12.dp, vertical = 4.dp)
                 ) {
                     Text("Speed:", color = Color.White, modifier = Modifier.padding(end = 8.dp))
@@ -242,7 +256,8 @@ fun GameScreenWithSurfaceView(
                     Spacer(modifier = Modifier.height(24.dp))
                     Button(
                         onClick = {
-                            gameSurfaceView.value?.resetGame() // Call reset on the view instance
+                            // Call reset only if view reference exists
+                            gameSurfaceView.value?.resetGame()
                             intensitySliderValue = 1f // Reset slider UI state
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
@@ -254,3 +269,4 @@ fun GameScreenWithSurfaceView(
         }
     } // End Root Box
 }
+
